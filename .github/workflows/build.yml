@@ -1,0 +1,40 @@
+name: Build & Release RefTags
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Sources/**"
+      - "Info.plist"
+      - "build.sh"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal app
+        run: |
+          chmod +x build.sh
+          CI=1 ./build.sh
+
+      - name: Zip
+        run: |
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent RefTags.app ../RefTags.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.${{ github.run_number }}"
+          gh release create "$TAG" RefTags.zip \
+            --title "RefTags $TAG" \
+            --notes "**Install:** unzip, drag **RefTags** into Applications and open it.
+          First launch: System Settings → Privacy & Security → **Open Anyway**, then switch on RefTags under **Accessibility**."
