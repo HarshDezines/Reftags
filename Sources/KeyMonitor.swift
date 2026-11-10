@@ -90,6 +90,12 @@ final class KeyMonitor {
 
         guard Settings.enabled else { return pass }
 
+        // ↑ ↓ — move through autocomplete suggestions (only while a list is showing)
+        if popup.isList && !cmd && !ctrl && !opt && (keyCode == 125 || keyCode == 126) {
+            DispatchQueue.main.async { popup.moveSelection(keyCode == 125 ? 1 : -1) }
+            return nil
+        }
+
         // ⌃⌘V — accept the popup (only grabbed while the popup is showing)
         if ctrlCmdOnly && keyCode == Hotkeys.acceptKeyCode && popup.isVisible {
             buffer = ""
@@ -152,18 +158,52 @@ final class KeyMonitor {
     private func checkTyped() {
         let token = trailingToken()
         let popup = PopupController.shared
+        let prefix = Settings.prefix
+        let matches = store.suggestions(forToken: token)
 
-        if let entry = store.entry(forToken: token) {
-            let full = Settings.prefix + entry.tag
-            if popup.isVisible && popup.kind == .typed && popup.currentKey == full { return }
-            let images = store.images(for: entry)
-            let n = images.count
+        if !matches.isEmpty {
+            let key = "typed:" + token.lowercased()
+            if popup.isVisible && popup.kind == .typed && popup.currentKey == key { return }
+            let typedLower = token.lowercased()
+            let store = self.store
+
+            // Exactly what you typed and nothing else → the simple "Include rsherlock?" bubble.
+            if matches.count == 1 && prefix + matches[0].tag == typedLower {
+                let entry = matches[0]
+                let images = store.images(for: entry)
+                let n = images.count
+                DispatchQueue.main.async {
+                    popup.showSingle(kind: .typed, key: key,
+                                     title: "Include \(prefix + entry.tag)?",
+                                     subtitle: n == 1 ? "1 reference image" : "\(n) reference images",
+                                     images: images) {
+                        Paster.paste(entries: [entry])
+                    }
+                }
+                return
+            }
+
+            // Otherwise a suggestion list. Accepting completes the tag text, then pastes the face.
+            let rows = matches.map { e -> PopupModel.Row in
+                let label = prefix + e.tag
+                return PopupModel.Row(id: e.tag, label: label,
+                                      typed: label.hasPrefix(typedLower) ? typedLower.count : 0,
+                                      thumb: store.thumbnail(for: e), count: e.files.count)
+            }
+            let typedCount = token.count
             DispatchQueue.main.async {
-                popup.show(kind: .typed, key: full,
-                           title: "Include \(full)?",
-                           subtitle: n == 1 ? "1 reference image" : "\(n) reference images",
-                           images: images) {
-                    Paster.paste(entries: [entry])
+                popup.showList(key: key, rows: rows) { [weak self] i in
+                    guard i < matches.count else { return }
+                    let entry = matches[i]
+                    let full = prefix + entry.tag
+                    self?.buffer = ""
+                    if full == typedLower {
+                        Paster.paste(entries: [entry])
+                    } else {
+                        Paster.replaceTyped(deleteCount: typedCount, with: full) {
+                            Paster.paste(entries: [entry])
+                        }
+                    }
                 }
             }
             return
@@ -194,8 +234,8 @@ final class KeyMonitor {
             let title = found.count == 1
                 ? "Paste reference for \(Settings.prefix + found[0].tag)?"
                 : "Paste all \(found.count) \(Settings.prefix)-tags?"
-            PopupController.shared.show(kind: .pasted, key: "paste:" + names,
-                                        title: title, subtitle: names, images: thumbs) {
+            PopupController.shared.showSingle(kind: .pasted, key: "paste:" + names,
+                                              title: title, subtitle: names, images: thumbs) {
                 Paster.paste(entries: found)
             }
         }

@@ -6,25 +6,70 @@ final class KeyablePanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
-/// ⌃⌘R: a small box in the middle of the screen. Shows the copied image,
-/// type a tag, press Return. Done.
+/// ⌃⌘R:
+///  • an image is copied → small box shows it, type a tag, ↩
+///  • nothing copied → drag a box around any part of the screen (like ⌘⇧4)
+///  • box already open → ⌃⌘R again switches to capturing an area instead
 final class QuickAddController {
     static let shared = QuickAddController()
     private var panel: KeyablePanel?
     private var previousApp: NSRunningApplication?
+    private var capturing = false
 
-    func show() {
+    var isVisible: Bool { panel?.isVisible ?? false }
+
+    func handleHotkey() {
+        if capturing { return }
+        if isVisible { startCapture(); return }
+        rememberFrontApp()
         let images = RefStore.imagesFromPasteboard()
+        if images.isEmpty { startCapture() } else { show(images: images, fromClipboard: true) }
+    }
+
+    private func rememberFrontApp() {
         let me = ProcessInfo.processInfo.processIdentifier
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != me {
             previousApp = front
         }
+    }
 
+    // MARK: area capture
+
+    func startCapture() {
+        capturing = true
+        panel?.orderOut(nil)
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("reftags-capture-\(UUID().uuidString).png")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        proc.arguments = ["-i", "-x", file.path]   // interactive area selection, no sound
+        proc.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.capturing = false
+                if let img = NSImage(contentsOf: file) {
+                    try? FileManager.default.removeItem(at: file)
+                    self.show(images: [img], fromClipboard: false)
+                } else {
+                    // Esc pressed during capture
+                    self.close(restoreFocus: true)
+                }
+            }
+        }
+        do { try proc.run() } catch { capturing = false; NSSound.beep() }
+    }
+
+    // MARK: box
+
+    func show(images: [NSImage], fromClipboard: Bool) {
         let view = QuickAddView(images: images,
+                                fromClipboard: fromClipboard,
+                                projectName: RefStore.shared.project.name,
                                 onSave: { [weak self] tag in
                                     RefStore.shared.add(images: images, tag: tag)
                                     self?.close(restoreFocus: true)
                                 },
+                                onCapture: { [weak self] in self?.startCapture() },
                                 onCancel: { [weak self] in self?.close(restoreFocus: true) })
         let host = NSHostingView(rootView: view)
         let size = host.fittingSize
@@ -59,7 +104,10 @@ final class QuickAddController {
 
 struct QuickAddView: View {
     let images: [NSImage]
+    let fromClipboard: Bool
+    let projectName: String
     let onSave: (String) -> Void
+    let onCapture: () -> Void
     let onCancel: () -> Void
 
     @State private var tag = ""
@@ -70,43 +118,40 @@ struct QuickAddView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            if images.isEmpty {
-                VStack(spacing: 6) {
-                    Image(systemName: "photo.badge.plus").font(.system(size: 30)).foregroundColor(.secondary)
-                    Text("No image on the clipboard").font(.headline)
-                    Text("Copy a face image first (⌘C), then press \(Hotkeys.quickAddLabel).")
-                        .font(.caption).foregroundColor(.secondary)
-                    Button("OK") { onCancel() }.keyboardShortcut(.defaultAction).padding(.top, 4)
+            HStack(spacing: 8) {
+                ForEach(0..<min(images.count, 4), id: \.self) { i in
+                    Image(nsImage: images[i]).resizable().aspectRatio(contentMode: .fill)
+                        .frame(width: images.count == 1 ? 140 : 80, height: images.count == 1 ? 140 : 80)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
-                .padding(8)
-            } else {
-                HStack(spacing: 8) {
-                    ForEach(0..<min(images.count, 4), id: \.self) { i in
-                        Image(nsImage: images[i]).resizable().aspectRatio(contentMode: .fill)
-                            .frame(width: images.count == 1 ? 140 : 80, height: images.count == 1 ? 140 : 80)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                }
-                HStack(spacing: 2) {
-                    Text(Settings.prefix).font(.system(size: 20, weight: .bold, design: .rounded))
-                        .foregroundColor(.accentColor)
-                    TextField("tag name", text: $tag)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 20, weight: .semibold, design: .rounded))
-                        .focused($focused)
-                        .onSubmit { if !cleaned.isEmpty { onSave(tag) } }
-                }
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
+            }
+            HStack(spacing: 2) {
+                Text(Settings.prefix).font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundColor(.accentColor)
+                TextField("tag name", text: $tag)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 20, weight: .semibold, design: .rounded))
+                    .focused($focused)
+                    .onSubmit { if !cleaned.isEmpty { onSave(tag) } }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
 
-                Group {
-                    if let e = store.entry(named: cleaned) {
-                        Text("Adds to existing \(Settings.prefix + e.tag) (\(e.files.count) image\(e.files.count == 1 ? "" : "s"))")
-                    } else {
-                        Text("↩ save   ·   esc cancel")
-                    }
+            Group {
+                if let e = store.entry(named: cleaned) {
+                    Text("Adds to existing \(Settings.prefix + e.tag) (\(e.files.count) image\(e.files.count == 1 ? "" : "s"))")
+                } else {
+                    Text("↩ save to \(projectName)   ·   esc cancel")
                 }
-                .font(.caption).foregroundColor(.secondary)
+            }
+            .font(.caption).foregroundColor(.secondary)
+
+            if fromClipboard {
+                Button(action: onCapture) {
+                    Label("Capture an area instead  \(Hotkeys.quickAddLabel)", systemImage: "viewfinder")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
             }
         }
         .padding(18)

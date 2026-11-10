@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
 
         monitor = KeyMonitor(store: RefStore.shared)
-        monitor.onQuickAdd = { QuickAddController.shared.show() }
+        monitor.onQuickAdd = { QuickAddController.shared.handleHotkey() }
         startMonitor()
 
         // delete old unused tags now and every few hours
@@ -67,9 +67,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
         add(menu, "Open Library", #selector(openLibrary))
-        let quick = add(menu, "Add Copied Image as Tag   \(Hotkeys.quickAddLabel)", #selector(quickAdd))
-        quick.isEnabled = true
+        add(menu, "Add Face (copied image or screen area)   \(Hotkeys.quickAddLabel)", #selector(quickAdd))
         menu.addItem(.separator())
+
+        // Projects
+        let store = RefStore.shared
+        let projItem = NSMenuItem(title: "Project: \(store.project.name)\(store.project.shared ? "  (shared)" : "")",
+                                  action: nil, keyEquivalent: "")
+        let projMenu = NSMenu()
+        for p in Projects.all {
+            let it = NSMenuItem(title: p.name + (p.shared ? "  (shared)" : ""),
+                                action: #selector(switchProject(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = p.id
+            it.state = p.id == store.project.id ? .on : .off
+            projMenu.addItem(it)
+        }
+        projMenu.addItem(.separator())
+        let np = NSMenuItem(title: "New Project…", action: #selector(newProject), keyEquivalent: "")
+        np.target = self
+        projMenu.addItem(np)
+        let lf = NSMenuItem(title: "Link Shared Folder…", action: #selector(linkSharedFolder), keyEquivalent: "")
+        lf.target = self
+        projMenu.addItem(lf)
+        projItem.submenu = projMenu
+        menu.addItem(projItem)
 
         let count = RefStore.shared.entries.count
         let info = NSMenuItem(title: "\(count) character\(count == 1 ? "" : "s") saved · \(RefStore.shared.storageText)", action: nil, keyEquivalent: "")
@@ -126,7 +148,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         libraryWindow?.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func quickAdd() { QuickAddController.shared.show() }
+    @objc private func quickAdd() { QuickAddController.shared.handleHotkey() }
+
+    @objc private func switchProject(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let p = Projects.all.first(where: { $0.id == id }) else { return }
+        RefStore.shared.switchTo(p)
+    }
+
+    @objc func newProject() { ProjectActions.newProject() }
+    @objc func linkSharedFolder() { ProjectActions.linkSharedFolder() }
     @objc private func toggleEnabled() { Settings.enabled.toggle() }
     @objc private func toggleLabel() { Settings.labelImages.toggle() }
     @objc private func showFolder() { NSWorkspace.shared.open(RefStore.shared.dir) }
@@ -137,8 +168,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func clearAll() {
         let alert = NSAlert()
-        alert.messageText = "Delete all saved characters?"
-        alert.informativeText = "This removes every tag and its images (\(RefStore.shared.storageText))."
+        let p = RefStore.shared.project
+        alert.messageText = "Delete all characters in \(p.name)?"
+        alert.informativeText = p.shared
+            ? "This is a shared folder: the faces will be deleted for everyone using it (\(RefStore.shared.storageText))."
+            : "This removes every tag and its images (\(RefStore.shared.storageText))."
         alert.addButton(withTitle: "Delete All")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
@@ -182,5 +216,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit
         NSApp.mainMenu = main
+    }
+}
+
+/// Small dialogs used by the menu bar and the library window.
+enum ProjectActions {
+    static func ask(_ title: String, _ message: String, initial: String = "", button: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = initial
+        alert.accessoryView = field
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v
+    }
+
+    static func newProject() {
+        guard let name = ask("New Project", "Name it after your video, e.g. Monsoon Run.", button: "Create"),
+              let p = Projects.create(name: name) else { return }
+        RefStore.shared.switchTo(p)
+    }
+
+    /// Pick a folder inside Google Drive / Dropbox / iCloud that you shared with someone.
+    static func linkSharedFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Link Folder"
+        panel.message = "Choose a folder in Google Drive, Dropbox or iCloud Drive that you share with your team. Everyone who links the same folder uses the same faces."
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        RefStore.shared.switchTo(Projects.link(folder: url))
+    }
+
+    static func renameProject() {
+        let p = RefStore.shared.project
+        guard let name = ask("Rename Project", "", initial: p.name, button: "Rename") else { return }
+        Projects.rename(p, to: name)
+        RefStore.shared.refreshProject()
+    }
+
+    static func removeProject() {
+        let p = RefStore.shared.project
+        guard Projects.all.count > 1 else { NSSound.beep(); return }
+        let alert = NSAlert()
+        alert.messageText = p.shared ? "Unlink \(p.name)?" : "Delete \(p.name)?"
+        alert.informativeText = p.shared
+            ? "The shared folder and everyone's faces stay as they are. RefTags just stops using it."
+            : "This deletes the project and all its faces from this Mac."
+        alert.addButton(withTitle: p.shared ? "Unlink" : "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Projects.remove(p)
+        RefStore.shared.switchTo(Projects.active)
     }
 }

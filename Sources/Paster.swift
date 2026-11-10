@@ -49,8 +49,54 @@ enum Paster {
             sendCommandV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { step() }
         }
-        // small delay so the Return key that accepted the popup is fully released
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { step() }
+        // wait until you've let go of ⌃⌘ so the paste isn't mixed with your keys
+        whenModifiersReleased { step() }
+    }
+
+    /// Deletes what you typed ("rsh") and types the full tag ("rsherlock") in its place.
+    static func replaceTyped(deleteCount: Int, with text: String, then: @escaping () -> Void) {
+        whenModifiersReleased {
+            let src = CGEventSource(stateID: .combinedSessionState)
+            for _ in 0..<deleteCount { tap(src, key: 51) } // backspace
+            let units = Array(text.utf16)
+            var i = 0
+            while i < units.count {
+                let chunk = Array(units[i..<min(i + 16, units.count)])
+                for down in [true, false] {
+                    guard let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down) else { continue }
+                    chunk.withUnsafeBufferPointer { buf in
+                        e.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: buf.baseAddress)
+                    }
+                    e.flags = []
+                    e.setIntegerValueField(.eventSourceUserData, value: marker)
+                    e.post(tap: .cghidEventTap)
+                }
+                i += 16
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: then)
+        }
+    }
+
+    private static func tap(_ src: CGEventSource?, key: CGKeyCode) {
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) else { continue }
+            e.flags = []
+            e.setIntegerValueField(.eventSourceUserData, value: marker)
+            e.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Runs `block` once Control / Command / Option / Shift are released (max ~1 s).
+    static func whenModifiersReleased(tries: Int = 0, _ block: @escaping () -> Void) {
+        let held = CGEventSource.flagsState(.combinedSessionState)
+            .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
+        if held.isEmpty || tries >= 20 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: block)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                whenModifiersReleased(tries: tries + 1, block)
+            }
+        }
     }
 
     static func sendCommandV() {

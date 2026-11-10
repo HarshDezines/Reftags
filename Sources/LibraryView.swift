@@ -20,6 +20,8 @@ struct LibraryView: View {
     var body: some View {
         VStack(spacing: 0) {
             if !trusted { permissionBanner }
+            projectBar
+            Divider()
             addBar
             Divider()
             if store.entries.isEmpty {
@@ -57,6 +59,44 @@ struct LibraryView: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.12))
+    }
+
+    private var projectBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: store.project.shared ? "person.2.fill" : "folder.fill")
+                .foregroundColor(.accentColor)
+            Picker("", selection: Binding(
+                get: { store.project.id },
+                set: { id in
+                    if let p = Projects.all.first(where: { $0.id == id }) { store.switchTo(p) }
+                })) {
+                ForEach(Projects.all) { p in
+                    Text(p.name + (p.shared ? "  (shared)" : "")).tag(p.id)
+                }
+            }
+            .labelsHidden()
+            .frame(maxWidth: 240)
+
+            Button { ProjectActions.newProject() } label: { Label("New Project", systemImage: "plus") }
+            Button { ProjectActions.linkSharedFolder() } label: { Label("Link Shared Folder", systemImage: "link") }
+
+            Spacer()
+            Menu {
+                Button("Rename Project…") { ProjectActions.renameProject() }
+                Button("Show in Finder") { NSWorkspace.shared.open(store.dir) }
+                Divider()
+                Button(store.project.shared ? "Unlink Shared Folder…" : "Delete Project…") {
+                    ProjectActions.removeProject()
+                }
+                .disabled(Projects.all.count < 2)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 
     private var addBar: some View {
@@ -117,7 +157,7 @@ struct LibraryView: View {
             Spacer()
             Image(systemName: "person.crop.square.badge.camera").font(.system(size: 42)).foregroundColor(.secondary)
             Text("No characters yet").font(.title3.bold())
-            Text("Add a face above and give it a tag like \(Settings.prefix)bharat.\nThen type \(Settings.prefix)bharat anywhere → press \(Hotkeys.acceptLabel) → the image gets pasted.")
+            Text("Add a face above, press \(Hotkeys.quickAddLabel) anywhere, or drop images into this window.\nThen type \(Settings.prefix)bharat anywhere → press \(Hotkeys.acceptLabel) → the image gets pasted.")
                 .multilineTextAlignment(.center).foregroundColor(.secondary)
             Spacer()
         }

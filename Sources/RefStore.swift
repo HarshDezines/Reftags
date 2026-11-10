@@ -2,90 +2,162 @@ import AppKit
 import Combine
 import UniformTypeIdentifiers
 
-struct RefEntry: Codable, Identifiable, Equatable {
-    var tag: String        // stored without the prefix, lowercase: "bharat"
-    var files: [String]    // image file names inside the store folder
-    var lastUsed: Date?    // last time it was saved, added to or pasted
+struct RefEntry: Identifiable, Equatable {
+    var tag: String        // without the prefix, lowercase: "bharat"
+    var files: [String]    // image file names inside the project folder
     var id: String { tag }
 }
 
-/// Saves reference images in ~/Library/Application Support/RefTags
+/// The faces of the active project. The folder itself is the source of truth:
+/// every image file "<tag>-<anything>.jpg" belongs to that tag. That way a project
+/// inside a shared Google Drive / Dropbox / iCloud folder syncs between people for free.
 final class RefStore: ObservableObject {
     static let shared = RefStore()
 
     @Published private(set) var entries: [RefEntry] = []
-    let dir: URL
+    @Published private(set) var project: Project
+    var dir: URL { project.url }
+
     private var cache: [String: NSImage] = [:]
-    private var indexURL: URL { dir.appendingPathComponent("index.json") }
+    private var lastSignature = ""
+    private var watchTimer: Timer?
+    static let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "webp", "heic", "tif", "tiff", "gif", "bmp"]
 
     private init() {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        dir = base.appendingPathComponent("RefTags", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        load()
+        project = Projects.active
+        migrateLegacyIndex()
+        reload(force: true)
+        // pick up faces added by collaborators (or dropped into the folder in Finder)
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.reload()
+        }
     }
 
-    // MARK: persistence
+    // MARK: projects
 
-    private func load() {
-        guard let data = try? Data(contentsOf: indexURL),
-              let list = try? JSONDecoder().decode([RefEntry].self, from: data) else { return }
-        entries = list.filter { !$0.files.isEmpty }
-        // older saves have no date yet: start their clock now
-        var changed = false
-        for i in entries.indices where entries[i].lastUsed == nil {
-            entries[i].lastUsed = Date(); changed = true
+    func switchTo(_ p: Project) {
+        Projects.setActive(p)
+        project = p
+        cache.removeAll()
+        lastSignature = ""
+        reload(force: true)
+    }
+
+    /// Re-read the active project's name etc. after a rename / removal.
+    func refreshProject() {
+        let p = Projects.active
+        if p != project { switchTo(p) }
+    }
+
+    // MARK: scanning
+
+    static func tag(fromFileName name: String) -> String {
+        let stem = (name as NSString).deletingPathExtension
+        let base = stem.split(separator: "-", maxSplits: 1).first.map(String.init) ?? stem
+        return clean(base)
+    }
+
+    /// All tags in a folder, files oldest first.
+    static func scan(_ folder: URL) -> [RefEntry] {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey],
+                                                     options: [.skipsHiddenFiles]) else { return [] }
+        var byTag: [String: [(String, Date)]] = [:]
+        for u in urls where imageExtensions.contains(u.pathExtension.lowercased()) {
+            let name = u.lastPathComponent
+            let t = RefStore.tag(fromFileName: name)
+            guard !t.isEmpty else { continue }
+            let date = (try? u.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
+            byTag[t, default: []].append((name, date))
         }
-        if changed { save() }
+        return byTag.map { tag, files in
+            RefEntry(tag: tag, files: files.sorted { $0.1 < $1.1 }.map { $0.0 })
+        }.sorted { $0.tag < $1.tag }
+    }
+
+    func reload(force: Bool = false) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let found = RefStore.scan(dir)
+        let sig = found.map { $0.tag + ":" + $0.files.joined(separator: ",") }.joined(separator: "|")
+        if !force && sig == lastSignature { return }
+        lastSignature = sig
+        entries = found
+        for e in found where lastUsed(project.id, e.tag) == nil { setLastUsed(project.id, e.tag) }
+    }
+
+    /// v1 kept an index.json and renamed tags only inside it. Rename the files to match, then drop it.
+    private func migrateLegacyIndex() {
+        let index = Projects.baseDir.appendingPathComponent("index.json")
+        struct Old: Codable { var tag: String; var files: [String] }
+        guard let data = try? Data(contentsOf: index),
+              let list = try? JSONDecoder().decode([Old].self, from: data) else { return }
+        let fm = FileManager.default
+        for e in list {
+            for f in e.files where RefStore.tag(fromFileName: f) != e.tag {
+                let ext = (f as NSString).pathExtension
+                let to = "\(e.tag)-\(UUID().uuidString.prefix(8)).\(ext)"
+                try? fm.moveItem(at: Projects.baseDir.appendingPathComponent(f),
+                                 to: Projects.baseDir.appendingPathComponent(to))
+            }
+        }
+        try? fm.removeItem(at: index)
+    }
+
+    // MARK: last used (kept locally, never written into shared folders)
+
+    private func usedKey(_ projectID: String, _ tag: String) -> String { "used|\(projectID)|\(tag)" }
+
+    private func lastUsed(_ projectID: String, _ tag: String) -> Date? {
+        let t = UserDefaults.standard.double(forKey: usedKey(projectID, tag))
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+
+    private func setLastUsed(_ projectID: String, _ tag: String) {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: usedKey(projectID, tag))
+    }
+
+    func markUsed(_ tags: [String]) {
+        for t in tags { setLastUsed(project.id, t) }
     }
 
     // MARK: keeping storage small
 
-    /// Deletes tags not used for `Settings.autoDeleteDays` days (0 = never).
+    /// Deletes tags not used for `Settings.autoDeleteDays` days, in your own projects only
+    /// (never in shared folders, where other people's faces live).
     func cleanUpUnused() {
         let days = Settings.autoDeleteDays
         guard days > 0 else { return }
         let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
-        let old = entries.filter { ($0.lastUsed ?? Date()) < cutoff }
-        guard !old.isEmpty else { return }
-        for e in old { for f in e.files { deleteFile(f) } }
-        entries.removeAll { e in old.contains { $0.tag == e.tag } }
-        save()
-    }
-
-    func markUsed(_ tags: [String]) {
-        var changed = false
-        for i in entries.indices where tags.contains(entries[i].tag) {
-            entries[i].lastUsed = Date(); changed = true
+        let fm = FileManager.default
+        for p in Projects.all where !p.shared {
+            for e in RefStore.scan(p.url) {
+                guard let last = lastUsed(p.id, e.tag) else { setLastUsed(p.id, e.tag); continue }
+                if last < cutoff {
+                    for f in e.files { try? fm.removeItem(at: p.url.appendingPathComponent(f)) }
+                }
+            }
         }
-        if changed { save() }
+        cache.removeAll()
+        reload(force: true)
     }
 
     func clearAll() {
         for e in entries { for f in e.files { deleteFile(f) } }
-        entries.removeAll()
-        save()
+        reload(force: true)
     }
 
-    /// Total size of saved images, e.g. "4.2 MB".
+    /// Total size of this project's images, e.g. "4.2 MB".
     var storageText: String {
         var bytes: Int64 = 0
         for e in entries {
             for f in e.files {
-                let url = dir.appendingPathComponent(f)
-                if let n = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber {
+                let path = dir.appendingPathComponent(f).path
+                if let n = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber {
                     bytes += n.int64Value
                 }
             }
         }
         return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
-
-    private func save() {
-        entries.sort { $0.tag < $1.tag }
-        if let data = try? JSONEncoder().encode(entries) {
-            try? data.write(to: indexURL, options: .atomic)
-        }
     }
 
     // MARK: tags
@@ -110,6 +182,21 @@ final class RefStore: ObservableObject {
         let p = Settings.prefix
         guard t.count > p.count, t.hasPrefix(p) else { return nil }
         return entry(named: String(t.dropFirst(p.count)))
+    }
+
+    /// Autocomplete: "rsh" → [sherlock, shiva …]. Needs the prefix + at least 2 letters.
+    /// Exact match first, then tags starting with what you typed, then tags containing it.
+    func suggestions(forToken token: String, limit: Int = 6) -> [RefEntry] {
+        let t = token.lowercased()
+        let p = Settings.prefix
+        guard t.hasPrefix(p) else { return [] }
+        let typed = String(t.dropFirst(p.count))
+        guard typed.count >= 2 else { return [] }
+        let exact = entries.filter { $0.tag == typed }
+        let starts = entries.filter { $0.tag != typed && $0.tag.hasPrefix(typed) }
+        let contains = typed.count >= 3
+            ? entries.filter { !$0.tag.hasPrefix(typed) && $0.tag.contains(typed) } : []
+        return Array((exact + starts + contains).prefix(limit))
     }
 
     /// Every saved tag mentioned in a block of text, in order of first appearance.
@@ -137,55 +224,44 @@ final class RefStore: ObservableObject {
     func add(images: [NSImage], tag raw: String) -> Bool {
         let tag = RefStore.clean(raw)
         guard !tag.isEmpty, !images.isEmpty else { return false }
-        var newFiles: [String] = []
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var saved = false
         for img in images {
             // compressed JPEG, max 1536px: ~200–400 KB instead of several MB
             guard let jpg = img.downscaled(maxSide: 1536).jpegData(quality: 0.85) else { continue }
             let name = "\(tag)-\(UUID().uuidString.prefix(8)).jpg"
-            do {
-                try jpg.write(to: dir.appendingPathComponent(name), options: .atomic)
-                newFiles.append(name)
-            } catch { continue }
+            if (try? jpg.write(to: dir.appendingPathComponent(name), options: .atomic)) != nil { saved = true }
         }
-        guard !newFiles.isEmpty else { return false }
-        if let i = entries.firstIndex(where: { $0.tag == tag }) {
-            entries[i].files.append(contentsOf: newFiles)
-            entries[i].lastUsed = Date()
-        } else {
-            entries.append(RefEntry(tag: tag, files: newFiles, lastUsed: Date()))
-        }
-        save()
+        guard saved else { return false }
+        setLastUsed(project.id, tag)
+        reload(force: true)
         return true
     }
 
     func remove(tag: String) {
         guard let e = entry(named: tag) else { return }
         for f in e.files { deleteFile(f) }
-        entries.removeAll { $0.tag == tag }
-        save()
+        reload(force: true)
     }
 
     func removeImage(tag: String, file: String) {
-        guard let i = entries.firstIndex(where: { $0.tag == tag }) else { return }
-        entries[i].files.removeAll { $0 == file }
         deleteFile(file)
-        if entries[i].files.isEmpty { entries.remove(at: i) }
-        save()
+        reload(force: true)
     }
 
     @discardableResult
     func rename(tag: String, to raw: String) -> Bool {
         let newTag = RefStore.clean(raw)
-        guard !newTag.isEmpty, newTag != tag,
-              let i = entries.firstIndex(where: { $0.tag == tag }) else { return false }
-        if let j = entries.firstIndex(where: { $0.tag == newTag }) {
-            // merge into the existing tag
-            entries[j].files.append(contentsOf: entries[i].files)
-            entries.remove(at: i)
-        } else {
-            entries[i].tag = newTag
+        guard !newTag.isEmpty, newTag != tag, let e = entry(named: tag) else { return false }
+        let fm = FileManager.default
+        for f in e.files {
+            let ext = (f as NSString).pathExtension
+            let to = "\(newTag)-\(UUID().uuidString.prefix(8)).\(ext)"
+            try? fm.moveItem(at: dir.appendingPathComponent(f), to: dir.appendingPathComponent(to))
+            cache[f] = nil
         }
-        save()
+        setLastUsed(project.id, newTag)
+        reload(force: true)
         return true
     }
 

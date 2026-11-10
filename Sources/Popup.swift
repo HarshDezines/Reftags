@@ -1,63 +1,125 @@
 import AppKit
 import SwiftUI
 
-/// The little floating "Include rbharat?  ⌃⌘V" bubble. It never takes focus
-/// away from the app you're typing in.
+/// What the floating bubble shows. Either a single question ("Include rsherlock?")
+/// or a list of autocomplete suggestions you can move through with ↑ ↓.
+final class PopupModel: ObservableObject {
+    struct Row: Identifiable {
+        let id: String       // tag
+        let label: String    // "rsherlock"
+        let typed: Int       // how many leading characters match what you typed
+        let thumb: NSImage?
+        let count: Int
+    }
+    @Published var title = ""
+    @Published var subtitle = ""
+    @Published var images: [NSImage] = []
+    @Published var rows: [Row] = []
+    @Published var selected = 0
+}
+
 final class PopupController {
     static let shared = PopupController()
 
     enum Kind { case typed, pasted }
 
+    let model = PopupModel()
     private var panel: NSPanel?
-    private var onAccept: (() -> Void)?
+    private var host: NSHostingView<PopupView>?
+    private var onAcceptSingle: (() -> Void)?
+    private var onAcceptRow: ((Int) -> Void)?
     private var hideWork: DispatchWorkItem?
     private(set) var isVisible = false
     private(set) var kind: Kind = .typed
     private(set) var currentKey = ""
 
-    func show(kind: Kind, key: String, title: String, subtitle: String, images: [NSImage],
-              onAccept: @escaping () -> Void) {
-        self.kind = kind
-        self.currentKey = key
-        self.onAccept = onAccept
+    /// More than one suggestion → ↑ ↓ choose between them.
+    var isList: Bool { isVisible && model.rows.count > 1 }
 
-        let view = PopupView(title: title, subtitle: subtitle, images: images,
-                             shortcut: Hotkeys.acceptLabel,
-                             onTap: { [weak self] in self?.accept() })
-        let host = NSHostingView(rootView: view)
-        let size = host.fittingSize
+    func showSingle(kind: Kind, key: String, title: String, subtitle: String, images: [NSImage],
+                    onAccept: @escaping () -> Void) {
+        model.rows = []
+        model.title = title
+        model.subtitle = subtitle
+        model.images = images
+        model.selected = 0
+        onAcceptSingle = onAccept
+        onAcceptRow = nil
+        present(kind: kind, key: key)
+    }
 
-        let p = panel ?? makePanel()
-        panel = p
-        p.contentView = host
-        let origin = position(for: size)
-        p.setFrame(NSRect(origin: origin, size: size), display: true)
-        p.orderFrontRegardless()
-        isVisible = true
+    func showList(key: String, rows: [PopupModel.Row], onAccept: @escaping (Int) -> Void) {
+        let keepSelection = currentKey.hasPrefix("typed:") && isVisible
+        let previous = keepSelection && model.selected < model.rows.count ? model.rows[model.selected].id : nil
+        model.rows = rows
+        model.images = []
+        model.selected = previous.flatMap { id in rows.firstIndex { $0.id == id } } ?? 0
+        onAcceptRow = onAccept
+        onAcceptSingle = nil
+        present(kind: .typed, key: key)
+    }
 
-        hideWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.hide() }
-        hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + (kind == .typed ? 5 : 8), execute: work)
+    func moveSelection(_ delta: Int) {
+        guard !model.rows.isEmpty else { return }
+        model.selected = (model.selected + delta + model.rows.count) % model.rows.count
+        restartTimer()
     }
 
     func accept() {
-        let action = onAccept
+        let single = onAcceptSingle
+        let row = onAcceptRow
+        let index = model.selected
         hide()
-        action?()
+        if let row { row(index) } else { single?() }
     }
 
     func hide() {
         hideWork?.cancel()
         panel?.orderOut(nil)
         isVisible = false
-        onAccept = nil
+        onAcceptSingle = nil
+        onAcceptRow = nil
         currentKey = ""
     }
 
     func containsMouse() -> Bool {
         guard let p = panel, isVisible else { return false }
         return p.frame.contains(NSEvent.mouseLocation)
+    }
+
+    // MARK: window
+
+    private func present(kind: Kind, key: String) {
+        self.kind = kind
+        let wasVisible = isVisible
+        currentKey = key
+
+        let p = panel ?? makePanel()
+        panel = p
+        if host == nil {
+            let h = NSHostingView(rootView: PopupView(model: model, shortcut: Hotkeys.acceptLabel,
+                                                      onTap: { [weak self] i in
+                                                          self?.model.selected = i
+                                                          self?.accept()
+                                                      }))
+            host = h
+            p.contentView = h
+        }
+        host?.layoutSubtreeIfNeeded()
+        let size = host?.fittingSize ?? NSSize(width: 300, height: 60)
+        // Keep the bubble where it is while you keep typing; only place it fresh when it appears.
+        let origin = wasVisible ? NSPoint(x: p.frame.minX, y: p.frame.maxY - size.height) : position(for: size)
+        p.setFrame(NSRect(origin: origin, size: size), display: true)
+        p.orderFrontRegardless()
+        isVisible = true
+        restartTimer()
+    }
+
+    private func restartTimer() {
+        hideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (kind == .typed ? 6 : 8), execute: work)
     }
 
     private func makePanel() -> NSPanel {
@@ -92,43 +154,88 @@ final class PopupController {
 }
 
 struct PopupView: View {
-    let title: String
-    let subtitle: String
-    let images: [NSImage]
+    @ObservedObject var model: PopupModel
     let shortcut: String
-    let onTap: () -> Void
+    let onTap: (Int) -> Void
 
     var body: some View {
+        Group {
+            if model.rows.isEmpty { single } else { list }
+        }
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.1)))
+        .fixedSize()
+    }
+
+    private var keycap: some View {
+        Text(shortcut)
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 5).fill(Color.accentColor.opacity(0.85)))
+            .foregroundColor(.white)
+    }
+
+    private var single: some View {
         HStack(spacing: 10) {
             HStack(spacing: -10) {
-                ForEach(0..<min(images.count, 5), id: \.self) { i in
-                    Image(nsImage: images[i])
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 36, height: 36)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.9), lineWidth: 1.5))
+                ForEach(0..<min(model.images.count, 5), id: \.self) { i in
+                    thumb(model.images[i], size: 36)
                 }
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .semibold))
-                Text(subtitle).font(.system(size: 11)).foregroundColor(.secondary).lineLimit(1)
+                Text(model.title).font(.system(size: 13, weight: .semibold))
+                Text(model.subtitle).font(.system(size: 11)).foregroundColor(.secondary).lineLimit(1)
             }
             Spacer(minLength: 8)
-            Text(shortcut)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .padding(.horizontal, 7).padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 5).fill(Color.accentColor.opacity(0.85)))
-                .foregroundColor(.white)
+            keycap
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .frame(minWidth: 240, maxWidth: 420)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.1)))
         .contentShape(Rectangle())
-        .onTapGesture { onTap() }
-        .fixedSize()
+        .onTapGesture { onTap(0) }
+    }
+
+    private var list: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(model.rows.enumerated()), id: \.element.id) { i, row in
+                HStack(spacing: 9) {
+                    if let t = row.thumb { thumb(t, size: 28) } else {
+                        RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.2)).frame(width: 28, height: 28)
+                    }
+                    (Text(String(row.label.prefix(row.typed))).foregroundColor(.secondary)
+                        + Text(String(row.label.dropFirst(row.typed))).fontWeight(.semibold))
+                        .font(.system(size: 13, design: .rounded))
+                    if row.count > 1 {
+                        Text("\(row.count)").font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().fill(Color.secondary.opacity(0.2)))
+                    }
+                    Spacer(minLength: 12)
+                    if i == model.selected { keycap }
+                }
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 8)
+                    .fill(i == model.selected ? Color.accentColor.opacity(0.18) : Color.clear))
+                .contentShape(Rectangle())
+                .onTapGesture { onTap(i) }
+            }
+            if model.rows.count > 1 {
+                Text("↑ ↓ choose").font(.system(size: 10)).foregroundColor(.secondary)
+                    .padding(.horizontal, 8).padding(.top, 2)
+            }
+        }
+        .padding(6)
+        .frame(minWidth: 230, maxWidth: 360, alignment: .leading)
+    }
+
+    private func thumb(_ img: NSImage, size: CGFloat) -> some View {
+        Image(nsImage: img)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.22))
+            .overlay(RoundedRectangle(cornerRadius: size * 0.22).stroke(Color.white.opacity(0.9), lineWidth: 1.5))
     }
 }
 

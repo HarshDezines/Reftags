@@ -37,7 +37,26 @@ else
   compile "$ARCH" "$BIN"
 fi
 
-codesign --force --deep --sign - --identifier com.harsh.reftags "$APP"
+# App icon (optional): put a 1024×1024 icon.png next to this script
+if [ -f icon.png ]; then
+  ICONSET="build/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for s in 16 32 128 256 512; do
+    sips -z $s $s icon.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+    d=$((s * 2))
+    sips -z $d $d icon.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+  rm -rf "$ICONSET"
+fi
+
+# Signing: the release build signs with the same certificate every time, so macOS
+# keeps the Accessibility permission across updates. Local builds use ad-hoc signing.
+if [ -n "$SIGN_IDENTITY" ]; then
+  codesign --force --deep --sign "$SIGN_IDENTITY" --identifier com.harsh.reftags "$APP"
+else
+  codesign --force --deep --sign - --identifier com.harsh.reftags "$APP"
+fi
 
 if [ -n "$CI" ]; then
   echo "✅ Built $APP"
