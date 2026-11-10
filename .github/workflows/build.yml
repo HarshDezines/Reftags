@@ -1,4 +1,5 @@
 name: Build & Release RefTags
+# Release builds are signed with the RefTags Signing certificate (repo secrets) so macOS keeps permissions across updates.
 
 on:
   push:
