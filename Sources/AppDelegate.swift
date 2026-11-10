@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permissionTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Installer.moveToApplicationsIfNeeded() { return }
         setupMainMenu()
         setupStatusItem()
 
@@ -28,9 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: keyboard monitor + permission
 
     private func startMonitor() {
-        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let trusted = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
-        if trusted && monitor.start() { return }
+        if AXIsProcessTrusted() && monitor.start() { return }
+        // Not allowed yet: clear stale entries from older versions, then ask for this one.
+        Installer.requestAccessibility(openSettings: false)
         // Wait for the user to tick RefTags in System Settings → Privacy → Accessibility.
         permissionTimer?.invalidate()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] t in
@@ -183,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func openPermissions() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        Installer.requestAccessibility(openSettings: true)
     }
 
     @objc private func toggleLogin() {

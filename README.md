@@ -12,10 +12,12 @@ Made with Claude by someone with ADHD who kept forgetting to attach reference im
 
 **[Download RefTags.zip](https://github.com/HarshDezines/Reftags/releases/latest/download/RefTags.zip)** (macOS 13 or newer, Apple Silicon and Intel)
 
-1. Unzip it and drag **RefTags** into your **Applications** folder.
-2. Open it. macOS will say it can't check the app, because it isn't from the App Store. Go to
-   **System Settings → Privacy & Security**, scroll down and click **Open Anyway**.
+1. Unzip it and open **RefTags**. macOS will say it can't check the app, because it isn't from the App Store:
+   go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**.
+2. Click **Move to Applications** when RefTags asks. It reopens from there.
 3. When asked, turn on **RefTags** under **Accessibility**. It needs this to notice your tags and paste images.
+
+If the ⚠️ in the menu stays after allowing it, click it: RefTags clears the old entry and asks again.
 
 A small person icon appears in your menu bar. That's it.
 
